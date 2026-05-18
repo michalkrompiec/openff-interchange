@@ -137,10 +137,17 @@ def _convert(
                 "raise an issue describing how this error occurred.",
             )
 
+        # CUSP MOD (krompiec, 2026-05-18): dedupe atomtypes by SMIRNOFF
+        # potential key so atoms that share identical Lennard-Jones parameters
+        # share a single atomtype name. The upstream code emits one
+        # MOL{N}_{atom_index} name per atom, which makes `[ atomtypes ]`
+        # contain N rows even when only O(elements) distinct LJ tuples exist;
+        # `gmx grompp` then generates N²/2 LJ pair combinations and wedges
+        # around N ≈ 10k atoms on practical hardware (~130M combos at 16k).
+        # Mirrors what the LAMMPS writer already does
+        # (interop/lammps/export/export.py:`atom_type_map = dict(enumerate(vdw_handler.potentials))`).
+        pot_key_to_typename: dict[object, str] = {}
         for atom in unique_molecule.atoms:
-            atom_type_name = f"{unique_molecule.name}_{particle_map[unique_molecule.atom_index(atom)]}"
-            _atom_atom_type_map[atom] = atom_type_name
-
             # when looking up parameters, use the topology index, not the particle index ...
             # ... or so I think is the expectation of the `TopologyKey`s in the vdW collection
             topology_index = interchange.topology.atom_index(atom)
@@ -148,11 +155,20 @@ def _convert(
                 atom_indices=(topology_index,),
             )
 
-            vdw_parameters = vdw_collection.potentials[vdw_collection.key_map[key]].parameters
+            pot_key = vdw_collection.key_map[key]
+            if pot_key in pot_key_to_typename:
+                atom_type_name = pot_key_to_typename[pot_key]
+                _atom_atom_type_map[atom] = atom_type_name
+                continue  # atom_type already registered for an earlier atom with the same potential
 
-            # Build atom types
+            # First atom carrying this potential — register a fresh atom type.
+            atom_type_name = f"{unique_molecule.name}_{len(pot_key_to_typename)}"
+            pot_key_to_typename[pot_key] = atom_type_name
+            _atom_atom_type_map[atom] = atom_type_name
+
+            vdw_parameters = vdw_collection.potentials[pot_key].parameters
             system.atom_types[atom_type_name] = LennardJonesAtomType(
-                name=_atom_atom_type_map[atom],
+                name=atom_type_name,
                 bonding_type="",
                 atomic_number=atom.atomic_number,
                 mass=MASSES[atom.atomic_number],
@@ -162,17 +178,22 @@ def _convert(
                 epsilon=vdw_parameters["epsilon"].to("kilojoule_per_mole"),
             )
 
+        # Virtual sites are still per-site (their potentials are usually one
+        # per site by construction), but apply the same dedupe-by-potential
+        # for safety.
         for virtual_site_key in molecule_virtual_site_map[interchange.topology.molecule_index(unique_molecule)]:
-            atom_type_name = f"{unique_molecule.name}_{particle_map[virtual_site_key]}"
+            vs_pot_key = vdw_collection.key_map[virtual_site_key]
+            if vs_pot_key in pot_key_to_typename:
+                _atom_atom_type_map[virtual_site_key] = pot_key_to_typename[vs_pot_key]
+                continue
+            atom_type_name = f"{unique_molecule.name}_{len(pot_key_to_typename)}"
+            pot_key_to_typename[vs_pot_key] = atom_type_name
             _atom_atom_type_map[virtual_site_key] = atom_type_name
 
-            topology_index = particle_map[virtual_site_key]
-
-            vdw_parameters = vdw_collection.potentials[vdw_collection.key_map[virtual_site_key]].parameters
-
+            vdw_parameters = vdw_collection.potentials[vs_pot_key].parameters
             # TODO: Separate class for "atom types" representing virtual sites?
             system.atom_types[atom_type_name] = LennardJonesAtomType(
-                name=_atom_atom_type_map[virtual_site_key],
+                name=atom_type_name,
                 bonding_type="",
                 atomic_number=0,
                 mass=Quantity(0.0, "dalton"),
